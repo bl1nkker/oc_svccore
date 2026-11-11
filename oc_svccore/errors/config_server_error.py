@@ -1,2 +1,0 @@
-class ConfigServerError(RuntimeError):
-    pass

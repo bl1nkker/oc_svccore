@@ -8,6 +8,7 @@ Shared base for Python services: errors, authentication, web app factory, loggin
 - [config](#config) - settings and secrets from env, Vault and the config server
 - [logging](#logging) - ECS JSON logs and tracing
 - [db](#db) - database, transactions and repositories
+- [metrics](#metrics) - Prometheus metrics and dependency checks
 - [web](#web) - Flask app factory
 
 ## errors
@@ -365,6 +366,83 @@ class NoteRepo(DataRepo[Note]):
 
 `list_paged` does not check `page` and `page_size`, the API layer validates them. `BaseRepo` is a repository without the model methods, for raw SQL.
 
+## metrics
+
+`oc_svccore.metrics` defines the Prometheus metrics of a process, with the names and labels of the observability guardrails, and the ways to update them. The metrics live in the memory of the process. Serving them is up to the process: `web` adds `GET /metrics`, a worker starts its own endpoint. The module does not depend on HTTP, a framework or a database library.
+
+- `kinds/` - the metrics: `build_info.py`, `dependencies.py`, `operation.py`;
+- `setup.py`, `registry.py`, `checks.py`, `build_config.py` - the setup, the registry with the service prefix, the dependency checks and the build config.
+
+### Startup
+
+A web service gets it from `create_app(service="notes", checks=...)`. A worker calls it itself and serves the metrics with `prometheus_client`:
+
+```python
+from prometheus_client import start_http_server
+
+metrics.setup("notes_worker", {"postgres": database.ping})
+start_http_server(8080)
+```
+
+Every metric name starts with the service name, `-` and other non-word characters replaced by `_`. Each metric is created once per process, so building the app again in tests does not fail on a duplicate.
+
+### Metrics
+
+| Metric                                                 | Labels                                    | Updated                                                                 |
+| ------------------------------------------------------ | ----------------------------------------- | ----------------------------------------------------------------------- |
+| `<service>_build_info`                                 | `version`, `git_sha`                      | at setup, from `APP_VERSION` and `GIT_SHA`, `unknown` when not set      |
+| `<service>_dependency_up`                              | `dependency`                              | on every scrape, by running the checks                                  |
+| `<service>_dependency_request_duration_seconds`        | `dependency`, `outcome` (`success`/`error`) | on every database query and every `metrics.dependency` block          |
+| `<service>_<operation>_total`                          | `outcome`                                 | on every attempt of a business operation                                |
+| `<service>_<operation>_duration_seconds`               |                                           | on every attempt                                                        |
+| `<service>_<operation>_last_success_timestamp_seconds` |                                           | on success, `0` until the first one                                     |
+
+The default runtime metrics of `prometheus_client` stay on. The HTTP request metrics are made by [web](#metrics-endpoint).
+
+### Business operations
+
+Declare an operation once, at module level, and wrap the code that does it:
+
+```python
+CREATE_NOTE = metrics.operation("create_note")
+
+
+@bp.post("")
+@CREATE_NOTE
+def create_note():
+    ...
+
+
+with CREATE_NOTE.track():
+    ...
+```
+
+| `outcome`  | When                                                                                     |
+| ---------- | ---------------------------------------------------------------------------------------- |
+| `success`  | no exception                                                                             |
+| `rejected` | a `BaseError` other than `UpstreamError`, or a pydantic `ValidationError`: the caller's mistake |
+| `failed`   | an `UpstreamError` or any other exception: the service's own failure, the one that alerts |
+
+Every outcome starts at `0`, so the series exist before the first attempt. An operation may be declared before `metrics.setup`, it is bound at setup.
+
+### Dependencies
+
+Time an outgoing call; an exception inside counts as `error`:
+
+```python
+with metrics.dependency("dp"):
+    dp.get_delivery(delivery_id)
+```
+
+Database queries are timed by [db](#database) itself.
+
+A check is a function that raises when the dependency is down, such as `database.ping`. The checks run in parallel, 2 seconds for all of them; a check that takes longer counts as down. They feed `dependency_up` and `/health`. A dependency that goes down is logged once at WARNING with the reason, and once at INFO when it is back. The reason is never in a metric or a response.
+
+### Rules
+
+- labels hold only values from a small fixed set: never an id, a user name, an e-mail, a URL or exception text;
+- the service README lists every business metric, and a test checks that `/metrics` has it.
+
 ## web
 
 ### Error responses
@@ -443,6 +521,15 @@ A 500 never shows the exception text. Each 5xx is logged once at ERROR with the 
 - the `X-Request-Id` response header with the trace id, the same as `trace.id` in the logs and `traceId` in an error body.
 
 Query strings and request bodies are not logged.
+
+### Metrics endpoint
+
+`create_app` sets up [metrics](#metrics) with its `service` and `checks` and adds:
+
+- `GET /metrics` in the Prometheus text format, without authentication;
+- `<service>_http_requests_total{method, route, status}` and `<service>_http_request_duration_seconds{method, route}`. `route` is the route template (`/notes/{note_id}`), an unknown path is `unmatched`. The probes and `/metrics` are not counted.
+
+The metrics are in the memory of one process, so gunicorn runs one worker per pod (`workers = 1`) and scales with threads and replicas.
 
 ### Database session
 

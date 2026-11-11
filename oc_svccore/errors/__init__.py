@@ -1,5 +1,4 @@
 from oc_svccore.errors.base_error import BaseError
-from oc_svccore.errors.config_server_error import ConfigServerError
 from oc_svccore.errors.types import (
     ConflictError,
     InvalidDataError,
@@ -12,7 +11,6 @@ from oc_svccore.errors.types import (
 
 __all__ = [
     "BaseError",
-    "ConfigServerError",
     "ConflictError",
     "InvalidDataError",
     "NotFoundError",
