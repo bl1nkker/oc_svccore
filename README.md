@@ -6,6 +6,7 @@ Shared base for Python services: errors, authentication, web app factory, loggin
 
 - [errors](#errors) - base errors and how to define service errors
 - [config](#config) - settings and secrets from env, Vault and the config server
+- [logging](#logging) - ECS JSON logs and tracing
 - [web](#web) - Flask app factory
 
 ## errors
@@ -219,6 +220,72 @@ Every built config logs one INFO line with the source of each key, never the val
 
 A source is `env`, `vault`, `config_server`, `default` (the default passed to `get`) or `not set` (the model default applies, if there is one). Configs built before `logging.setup` are not logged.
 
+## logging
+
+`oc_svccore.logging` sets up the logs and traces of a process through `oc-logging`: every record, from the service and its libraries, is one ECS JSON object per line on stdout. It works the same for a web service, a worker or a CLI command.
+
+### Startup
+
+Call `logging.setup` in `main`, right after `config.setup`:
+
+```python
+def main():
+    config.setup("notes")
+    logging.setup("notes")
+    ...
+```
+
+It:
+
+- writes ECS JSON with `service.name` and `service.environment` (`PYTHON_ENV` in lower case);
+- sets up OpenTelemetry tracing: a line logged inside a span has `trace.id` and `span.id`, and every call made with `requests` sends a `traceparent` header, so one `trace.id` finds a request in every service it went through;
+- sets `OTEL_SERVICE_NAME` to the service name when it is not set, so traces and logs have the same name.
+
+Spans are exported over OTLP only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Trace ids are made and passed on either way.
+
+### Config
+
+| Key         | Default | For                                                                     |
+| ----------- | ------- | ----------------------------------------------------------------------- |
+| `LOG_LEVEL` | `INFO`  | root level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, any case |
+
+A wrong value fails the start with `config.ConfigError`.
+
+### gunicorn
+
+gunicorn logs through `logconfig_dict` in `gunicorn.conf.py`, so its own lines are ECS JSON too:
+
+```python
+from oc_logging.ecs import ecs_logconfig
+
+from notes.main import SERVICE
+
+logconfig_dict = ecs_logconfig(SERVICE)
+```
+
+`gunicorn.conf.py` runs before the service, so gunicorn's own lines take `LOG_LEVEL` from the environment only, not from Vault or the config server.
+
+### Writing logs
+
+Use the standard `logging` module. Extra fields go to `extra` with dotted names, which come out nested:
+
+```python
+log = logging.getLogger(__name__)
+
+log.info("notes exported", extra={"notes.count": len(notes)})
+```
+
+```json
+{"@timestamp": "2026-11-11T07:26:33.346Z", "log.level": "info", "message": "notes exported",
+ "log": {"logger": "notes.export"}, "service": {"name": "notes"},
+ "trace": {"id": "bf4b57dee6ae2b235d7dc377122a43fa"}, "span": {"id": "a1256df6da8ad7db"}, "notes": {"count": 3}}
+```
+
+Rules:
+
+- never log secrets, tokens or request bodies;
+- log a failure once, at ERROR with `exc_info`, where it is handled. Do not log and re-raise.
+
 ## web
 
 ### Error responses
@@ -286,3 +353,14 @@ A validation error lists every wrong field in `data.errors`. `field` is the path
 ```
 
 A 500 never shows the exception text. Each 5xx is logged once at ERROR with the stack trace; 4xx are the caller's mistake and are not logged at ERROR.
+
+### Request logs
+
+`create_app` adds to every request except the probes and `/metrics`:
+
+- one access line on the `access` logger with `http.request.method`, `url.path`, `http.response.status_code` and `event.duration` in nanoseconds;
+- a span that continues an incoming `traceparent` header;
+- `user.name` of the caller on every line logged inside the request, once the caller is authenticated;
+- the `X-Request-Id` response header with the trace id, the same as `trace.id` in the logs and `traceId` in an error body.
+
+Query strings and request bodies are not logged.
