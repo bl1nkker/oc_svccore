@@ -7,6 +7,7 @@ Shared base for Python services: errors, authentication, web app factory, loggin
 - [errors](#errors) - base errors and how to define service errors
 - [config](#config) - settings and secrets from env, Vault and the config server
 - [logging](#logging) - ECS JSON logs and tracing
+- [db](#db) - database, transactions and repositories
 - [web](#web) - Flask app factory
 
 ## errors
@@ -286,6 +287,84 @@ Rules:
 - never log secrets, tokens or request bodies;
 - log a failure once, at ERROR with `exc_info`, where it is handled. Do not log and re-raise.
 
+## db
+
+`oc_svccore.db` is the database layer on SQLAlchemy 2: an engine with metrics, transaction scopes and base repositories. It comes with the `db` extra, `pip install oc-svccore[db]`. It does not depend on HTTP, so a worker or a script uses it the same way as a web service.
+
+### Config
+
+| Key              | For                                                   |
+| ---------------- | ----------------------------------------------------- |
+| `PSQL__URL`      | `host:port/db`, optionally `?search_path=schema`      |
+| `PSQL__USER`     | user                                                  |
+| `PSQL__PASSWORD` | password                                              |
+
+The keys follow the [config](#config) rules: `PSQL_URL` in env, the field `URL` of the Vault secret `PSQL`.
+
+`get_db_config().postgres_url()` builds the connection string. The user and the password are escaped, and `search_path` goes to `options=-csearch_path=...`, since PostgreSQL does not take it as a url parameter.
+
+### Database
+
+```python
+database = Database(get_db_config().postgres_url())
+```
+
+- `database.engine` checks a connection before use (`pool_pre_ping`) and has the default pool: 5 connections, 10 more under load;
+- connecting gives up after 5 seconds (`CONNECT_TIMEOUT_SEC`). Change it with `Database(url, connect_args={"connect_timeout": 10})`; other keyword arguments go to `create_engine`;
+- `database.sessionmaker()` opens a session;
+- `database.ping()` runs `select 1`, for the health checks: `checks={"postgres": database.ping}`;
+- every query is timed in `dependency_request_duration_seconds{dependency="postgres"}`. `Database(url, name="cnt")` changes the label.
+
+In a web service the session of a request comes from `web.request_session(database)`, see [Database session](#database-session). A worker or a script opens its own:
+
+```python
+with database.sessionmaker() as session:
+    NoteService(NoteRepo(session)).archive_old()
+```
+
+### Transactions
+
+`repo.session()` (the same as `session_context(session)`) is a transaction scope:
+
+- the outermost scope commits on success and rolls back on any exception;
+- a nested scope is a savepoint: when the outer code catches an error from it, only the nested part is rolled back;
+- reads need no scope.
+
+```python
+def create(self, title: str, author: str) -> Note:
+    with self._repo.session():
+        if self._repo.find_by_title(title):
+            raise NoteTitleTakenError()
+        return self._repo.save_or_update(Note(title=title, author=author))
+```
+
+Every outermost scope is a commit of its own. When one operation writes through several repositories, the service opens one scope around all of them, so either all is saved or nothing. Repositories built on the same session share its scopes.
+
+### Repositories
+
+`DataRepo[T]` holds the common operations on one model. A repository adds its own queries on top:
+
+```python
+class NoteRepo(DataRepo[Note]):
+    _type = Note
+    _order_by_map = {"title": Note.title, "created_at": Note.created_at}
+
+    def find_by_title(self, title: str) -> Note | None:
+        return self.first(self.query().filter(Note.title == title))
+```
+
+| Method                                             | Does                                                               |
+| -------------------------------------------------- | ------------------------------------------------------------------ |
+| `query()`                                          | a `Query` of the model                                             |
+| `get_by_db_id(id)`                                 | the row with this `id`, or `None`                                  |
+| `first(q)`, `single(q)`, `list_all(q)`, `count(q)` | run a query, `query()` by default                                  |
+| `list_paged(page, page_size, q)`                   | `Pagination(page, page_size, total, items)`, `page` starts at 1    |
+| `order_by(key, asc, q)`                            | sorts by a key of `_order_by_map`; an unknown key sorts by `id`    |
+| `with_for_update(q)`                               | `SELECT ... FOR UPDATE`                                            |
+| `save_or_update(entity)`, `delete(entity)`         | add or delete and flush; the commit is up to the transaction scope |
+
+`list_paged` does not check `page` and `page_size`, the API layer validates them. `BaseRepo` is a repository without the model methods, for raw SQL.
+
 ## web
 
 ### Error responses
@@ -364,3 +443,12 @@ A 500 never shows the exception text. Each 5xx is logged once at ERROR with the 
 - the `X-Request-Id` response header with the trace id, the same as `trace.id` in the logs and `traceId` in an error body.
 
 Query strings and request bodies are not logged.
+
+### Database session
+
+`web.request_session(database)` gives the session of the current request: one per database, opened on first use and closed when the request ends.
+
+```python
+def service() -> NoteService:
+    return NoteService(NoteRepo(web.request_session(database)))
+```
