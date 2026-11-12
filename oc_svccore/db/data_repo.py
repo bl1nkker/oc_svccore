@@ -4,6 +4,7 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Query
 
 from oc_svccore.db.base_repo import BaseRepo
+from oc_svccore.db.invalid_sort_error import InvalidSortError
 from oc_svccore.db.pagination import Pagination
 
 T = TypeVar("T")
@@ -51,11 +52,13 @@ class DataRepo(BaseRepo, Generic[T]):
     def with_for_update(self, query: Query[T] | None = None) -> Query[T]:
         return self._q(query).with_for_update()
 
-    def order_by(self, order_by: str | None = None, asc: bool = True, query: Query[T] | None = None) -> Query[T]:
-        column = self._order_by_map.get(order_by) if order_by else None
+    def order_by(self, sort: str | None = None, query: Query[T] | None = None) -> Query[T]:
+        if not sort:
+            return self._q(query).order_by(getattr(self._type, self._default_order_by))
+        column = self._order_by_map.get(sort.removeprefix("-"))
         if column is None:
-            column = getattr(self._type, self._default_order_by)
-        return self._q(query).order_by(column if asc else desc(column))
+            raise InvalidSortError(data={"sort": sort, "allowed": sorted(self._order_by_map)})
+        return self._q(query).order_by(desc(column) if sort.startswith("-") else column)
 
     def _q(self, query: Query[T] | None) -> Query[T]:
         return self.query() if query is None else query
