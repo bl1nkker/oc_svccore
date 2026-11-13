@@ -855,3 +855,15 @@ def test_routes_match_the_spec(app):
 ### Plans
 
 Services and repositories are to be tested on a real database instead of fakes, with the `db_*` fixtures above: each test in its own transaction that is rolled back. For that `db_migrations` needs migrations that build the schema of the database from scratch, and our databases do not have them yet. Until then a service tests its API with `app.test_client()` and its services with `MagicMock` repositories, and the repositories are not tested. `services/notes` already runs on a real database with its alembic migrations.
+
+## Open questions
+
+To decide together with the team:
+
+1. **Flask or FastAPI.** Flask for now, as in postgres-api. We want to move to FastAPI for the API docs it generates from the code: the OpenAPI spec would then come from the routes and DTOs instead of a hand-written `spec/openapi.yaml` checked by `assert_spec`. oc-logging only instruments Flask today, so FastAPI needs a small fix there.
+2. **Authorization.** The chassis does authentication only, plus `PermissionDeniedError`. Open: the permission model (groups from `/userinfo` or roles in our own database), and whether the chassis should have a shared helper. Needs an answer before the first Python BFF, since the frontend gets the permissions from `/auth/me`.
+3. **The real user from a BFF to internal services.** An internal service only sees the technical account of the BFF, so `user.name` in its logs is that account. Pass the user in a header the service trusts only from that account?
+4. **DI.** Every service is wired by hand in `main()`, without a container. When would a service need one, such as dishka? Web and workers sharing one graph is the main case.
+5. **CI.** The image build has to pass `--build-arg APP_VERSION=<image tag> --build-arg GIT_SHA=<short sha>`, otherwise `build_info` shows `unknown`.
+6. **Gaps against the API guideline, left for later:** a database that goes down during a request is a 500, not a 503; times in responses are not normalized to UTC; `total` is always required in lists.
+7. **Later:** where logs and traces go (OTLP collector), publishing the package and the repo names, the minimum Python version (3.12 now).
