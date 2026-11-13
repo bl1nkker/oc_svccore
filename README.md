@@ -9,7 +9,13 @@ Shared base for Python services: errors, authentication, web app factory, loggin
 - [logging](#logging) - ECS JSON logs and tracing
 - [db](#db) - database, transactions and repositories
 - [metrics](#metrics) - Prometheus metrics and dependency checks
+- [authn](#authn) - token checks and the service's own token for outgoing calls
+- [dto](#dto) - base DTOs: camelCase fields and the shape of lists
 - [web](#web) - Flask app factory
+- [cli](#cli-experimental) - command line app factory, experimental
+- [testing](#testing) - test tokens, a fake Keycloak and pytest fixtures
+
+`web` and `cli` are the two ways in. The other modules work the same behind either of them; an adapter only turns its input into calls and the errors into its own answer, an HTTP response or an exit code.
 
 ## errors
 
@@ -348,7 +354,7 @@ Every outermost scope is a commit of its own. When one operation writes through 
 ```python
 class NoteRepo(DataRepo[Note]):
     _type = Note
-    _order_by_map = {"title": Note.title, "created_at": Note.created_at}
+    _order_by_map = {"title": Note.title, "createdAt": Note.created_at}
 
     def find_by_title(self, title: str) -> Note | None:
         return self.first(self.query().filter(Note.title == title))
@@ -360,11 +366,17 @@ class NoteRepo(DataRepo[Note]):
 | `get_by_db_id(id)`                                 | the row with this `id`, or `None`                                  |
 | `first(q)`, `single(q)`, `list_all(q)`, `count(q)` | run a query, `query()` by default                                  |
 | `list_paged(page, page_size, q)`                   | `Pagination(page, page_size, total, items)`, `page` starts at 1    |
-| `order_by(key, asc, q)`                            | sorts by a key of `_order_by_map`; an unknown key sorts by `id`    |
+| `order_by(sort, q)`                                | sorts by `sort` of a list query, see below                         |
 | `with_for_update(q)`                               | `SELECT ... FOR UPDATE`                                            |
 | `save_or_update(entity)`, `delete(entity)`         | add or delete and flush; the commit is up to the transaction scope |
 
 `list_paged` does not check `page` and `page_size`, the API layer validates them. `BaseRepo` is a repository without the model methods, for raw SQL.
+
+`order_by(sort)` takes `sort` as the caller sent it in a [list query](#lists): `createdAt`, or `-createdAt` for descending. The keys of `_order_by_map` are these API names, so only the listed fields can be sorted by. Without `sort` the rows are sorted by `_default_order_by` (`id`). Any other field raises `InvalidSortError`, a 400:
+
+```json
+{ "message": "_err_msg_invalid_sort", "code": "invalid_sort", "data": { "sort": "author", "allowed": ["createdAt", "title"] } }
+```
 
 ## metrics
 
@@ -420,7 +432,7 @@ with CREATE_NOTE.track():
 | `outcome`  | When                                                                                     |
 | ---------- | ---------------------------------------------------------------------------------------- |
 | `success`  | no exception                                                                             |
-| `rejected` | a `BaseError` other than `UpstreamError`, or a pydantic `ValidationError`: the caller's mistake |
+| `rejected` | a `BaseError` other than `UpstreamError`, input that fails `parse` among them: the caller's mistake |
 | `failed`   | an `UpstreamError` or any other exception: the service's own failure, the one that alerts |
 
 Every outcome starts at `0`, so the series exist before the first attempt. An operation may be declared before `metrics.setup`, it is bound at setup.
@@ -442,6 +454,119 @@ A check is a function that raises when the dependency is down, such as `database
 
 - labels hold only values from a small fixed set: never an id, a user name, an e-mail, a URL or exception text;
 - the service README lists every business metric, and a test checks that `/metrics` has it.
+
+## authn
+
+`oc_svccore.authn` checks whose token it is, gets the service's own token for outgoing calls and talks the OIDC login of a BFF, all through Keycloak. It does not depend on HTTP or a framework: reading the token or the session from a request is done by [web](#authentication).
+
+| Case | Use |
+| --- | --- |
+| a resource service: other services call it with a Keycloak token | `web.bearer_auth()`, see [Authentication](#authentication) |
+| a BFF: a browser calls it with a session cookie | `web.session_auth()`, see [BFF session](#bff-session) |
+| the service calls another service | `PasswordTokenAuth`, see [Outgoing calls](#outgoing-calls) |
+| a token comes outside an HTTP request, in a worker or a CLI | `verifier.principal(token)`, see [Checking a token](#checking-a-token) |
+
+### Config
+
+| Key                   | For                                                                                  |
+| --------------------- | ------------------------------------------------------------------------------------ |
+| `OIDC__ISSUER_URL`    | the realm, `https://<keycloak>/realms/<realm>`: issuer of the tokens, base of the key and token endpoints |
+| `OIDC__CLIENT_ID`     | the client for outgoing calls                                                        |
+| `OIDC__CLIENT_SECRET` | its secret, optional                                                                 |
+
+### Principal
+
+`Principal(username, claims)` is who made the call. `username` is `preferred_username` of the token, or `sub` when there is none; `claims` holds every field of the checked token. For a resource service it is usually the technical account of the calling service, not a person.
+
+### Checking a token
+
+```python
+verifier = authn.keycloak_verifier(authn.get_auth_config().issuer_url)
+principal = verifier.principal(token)
+```
+
+- the signature is checked with the realm keys (JWKS), and so are the issuer and the expiry. `aud` is checked only when given, `keycloak_verifier(url, audience="portal")`: every token of the realm has the same `aud` today, so a resource service gains nothing from it;
+- the keys are fetched from Keycloak with a 5 second timeout (`JWKS_TIMEOUT_SEC`) and cached for 5 minutes;
+- a bad, expired or foreign token raises `UnauthorizedError("_err_msg_invalid_token")` and logs one WARNING line with the reason;
+- Keycloak not answering raises `UpstreamUnavailableError("_err_msg_keycloak_unavailable")`.
+
+`verifier.verify(token)` returns the claims only. In tests, `oc_svccore.testing.Issuer` signs tokens and its `verifier()` checks them without Keycloak.
+
+### Outgoing calls
+
+`PasswordTokenAuth` is a `requests` auth: it gets a token with the password grant of the service account and adds `Authorization: Bearer` to every call.
+
+```python
+oidc = authn.get_oidc_client_config()
+dp = get_dp_client_config()
+auth = authn.PasswordTokenAuth(issuer_url, oidc.client_id, oidc.client_secret, dp.username, dp.password)
+
+requests.get(f"{dp.url}/api/v1/deliveries", auth=auth, timeout=10)
+api.web.auth = auth  # an oc_cdtapi client
+```
+
+- the token is kept until 30 seconds before it expires, one fetch at a time across threads;
+- the token endpoint is called with a 10 second timeout, `timeout=` changes it;
+- Keycloak not answering or answering 5xx raises `UpstreamUnavailableError("_err_msg_keycloak_unavailable")` (503);
+- a 4xx, such as a wrong password, raises `UpstreamError("_err_msg_keycloak_rejected_credentials")` (502), so a wrong secret is not mistaken for an outage.
+
+The account and the password are in the config of the service that makes the calls, see [Defining a config](#defining-a-config).
+
+### Login of a BFF
+
+`OidcClient(issuer_url, client_id, client_secret, redirect_url)` is the Keycloak side of the browser login: the login URL with PKCE (S256) and the scopes `openid profile email`, the code exchange, the refresh and the logout URL. The id token is checked with `aud` equal to the client id. A refresh that Keycloak refuses (`invalid_grant`) raises `RefreshRejectedError`; Keycloak not answering raises `UpstreamUnavailableError`. The cookies and the `/auth/*` routes around it are [web.SessionAuth](#bff-session).
+
+## dto
+
+`oc_svccore.dto` holds the base DTOs of the API contract: the field names on the wire and the shape of lists. It does not depend on HTTP or a framework, so a client, such as a CLI that reads the answer of a service, uses the same DTOs.
+
+### Fields
+
+`ApiModel` is the base of request and response models. The fields are snake_case in Python and camelCase in JSON and in the query string:
+
+```python
+class ReadNote(ApiModel):
+    note_id: str
+    created_at: datetime
+
+
+ReadNote.model_validate(note).model_dump(mode="json")  # {"noteId": "1", "createdAt": "2026-11-09T10:15:00Z"}
+```
+
+- input is read by either name, `createdAt` or `created_at`;
+- `model_dump` writes camelCase without `by_alias=True`;
+- `model_validate` takes an ORM object as well as a dict.
+
+Input from a caller is read with `parse`, output with `model_validate`:
+
+```python
+note_dto.Create.parse({"title": ""})  # raises ValidationFailedError: 400 validation, every wrong field in data.errors
+```
+
+`ValidationFailedError` is an `InvalidDataError`, so wrong input is a 400 and an operation counts it as `rejected`. A pydantic `ValidationError` from `model_validate` is not translated: a response that does not fit its model is the service's bug, a logged 500 `internal`. In a web service `@web.body` and `@web.query` call `parse`, see [Request body and query](#request-body-and-query).
+
+### Lists
+
+```
+GET /api/v1/notes?page=2&pageSize=50&sort=-createdAt&search=report
+{ "items": [ ... ], "page": 2, "pageSize": 50, "total": 1342 }
+```
+
+`ListQuery` reads the query string: `page` from 1 to 1000000, `pageSize` 50 by default and at most 500, `sort` as `field` or `-field`, and `search`, free text the service looks up as it sees fit. A wrong value is a 400 that names the parameter, `"field": "pageSize"`. Filters go into a subclass and are named after their field:
+
+```python
+class NoteQuery(ListQuery):
+    author: str | None = None
+
+
+@bp.get("")
+@web.query(NoteQuery)
+def list_notes(query: NoteQuery):
+    pagination = service().list(query.page, query.page_size, query.sort)
+    return Page[ReadNote].model_validate(pagination).model_dump(mode="json")
+```
+
+`Page[T]` is the answer, always wrapped in `items`. It is built from the `Pagination` of `list_paged`, and `sort` goes to `order_by`, see [Repositories](#repositories).
 
 ## web
 
@@ -485,9 +610,10 @@ Errors made by the web layer itself:
 
 | Case                                            | Status | `code`                 | `message`                       |
 | ----------------------------------------------- | ------ | ---------------------- | ------------------------------- |
-| request body or query fails pydantic validation | 400    | `validation`           | `_err_msg_validation`           |
+| request body or query fails `parse`             | 400    | `validation`           | `_err_msg_validation`           |
 | no `Authorization: Bearer` header               | 401    | `unauthorized`         | `_err_msg_missing_token`        |
 | token with a bad signature, issuer or expiry    | 401    | `unauthorized`         | `_err_msg_invalid_token`        |
+| no session, or the session ended (BFF)          | 401    | `unauthorized`         | `_err_msg_no_session`           |
 | unknown route                                   | 404    | `not_found`            | `_err_msg_not_found`            |
 | method not allowed on a route                   | 405    | `method_not_allowed`   | `_err_msg_method_not_allowed`   |
 | Keycloak keys cannot be fetched                 | 503    | `upstream_unavailable` | `_err_msg_keycloak_unavailable` |
@@ -509,6 +635,8 @@ A validation error lists every wrong field in `data.errors`. `field` is the path
 }
 ```
 
+A pydantic `ValidationError` that is not from `parse`, such as a response model that does not fit, is a 500 `internal`.
+
 A 500 never shows the exception text. Each 5xx is logged once at ERROR with the stack trace; 4xx are the caller's mistake and are not logged at ERROR.
 
 ### Request logs
@@ -522,6 +650,72 @@ A 500 never shows the exception text. Each 5xx is logged once at ERROR with the 
 
 Query strings and request bodies are not logged.
 
+### Authentication
+
+`create_app(authenticate=...)` checks every request before the view. The service picks how:
+
+```python
+app = web.create_app(__name__, service="dp", authenticate=web.bearer_auth())    # a resource service
+app = web.create_app(__name__, service="bff", authenticate=web.session_auth())  # a BFF
+```
+
+| | `web.bearer_auth()` | `web.session_auth()` |
+| --- | --- | --- |
+| Caller | another service with a Keycloak token | a browser with a session cookie |
+| Each request | `Authorization: Bearer <token>`, checked by [authn](#checking-a-token) | the session cookie, refreshed in Keycloak when it is older than the refresh interval |
+| Extra routes | none | `/auth/login`, `/auth/callback`, `/auth/logout`, `/auth/me`, see [BFF session](#bff-session) |
+| Config | [authn](#authn) | authn plus the session keys below |
+
+Both build everything from the config. `web.bearer(verifier)` and `web.SessionAuth(client, config)` take the parts directly, for tests.
+
+- every route needs a caller except views marked `@web.public`. The probes and `/metrics` are public; an unknown path is a 404 without a check;
+- in a view, `web.current_principal()` returns the caller. In a public view it raises `UnauthorizedError`;
+- `authenticate` may also be any other function from a request to a `Principal`.
+
+```python
+@bp.post("")
+def create_note():
+    author = web.current_principal().username
+    ...
+```
+
+A service without authentication says so with `authenticate=None`. Then no request is checked and `web.current_principal()` raises `UnauthorizedError` everywhere. The argument has no default, so a service that forgets it does not start instead of being open to everyone:
+
+```python
+app = web.create_app(__name__, service="dlgen", authenticate=None)
+```
+
+### BFF session
+
+`web.session_auth()` works like the Go bff (`idp-bff/internal/auth`), so the frontend and the deployment config are the same for both:
+
+| Route | Does |
+| --- | --- |
+| `GET /auth/login?returnTo=<path>&origin=<origin>` | starts the Keycloak login with PKCE and redirects there. `returnTo` is kept only when it is a plain path of this site, `origin` only when it is in `OIDC_RETURN_ORIGINS` |
+| `GET /auth/callback` | checks the state, exchanges the code, starts the session, redirects to `origin` + `returnTo`, or to `POST_LOGIN_REDIRECT_PATH`. A failure shows a short page with a "Sign in again" link |
+| `GET /auth/logout?returnTo=&origin=` | drops the session and redirects to the Keycloak logout |
+| `GET /auth/me` | `{"authenticated": true, "sub", "username", "name", "email"}`, or 401 without a session |
+
+- the session lives in HttpOnly, SameSite=Lax cookies, encrypted and signed: `<name>` (who and until when), `<name>_rt` (the refresh token), `<name>_idt` (the id token for the logout) and `<name>_txn` for the 30 minutes of a login;
+- a session older than `SESSION_REFRESH_INTERVAL` is refreshed in Keycloak on the next request. When Keycloak refuses the refresh, the session is dropped and the request gets 401; when Keycloak does not answer, the current session goes on;
+- a session ends after `SESSION_TTL` without a refresh;
+- the cookie format is not the one of the Go bff (gorilla securecookie), so a cookie of one does not work in the other;
+- `/auth/me` has no `permissions`: they are authorization, which is not in this library.
+
+| Key | Default | For |
+| --- | --- | --- |
+| `OIDC_REDIRECT_URL` | | the callback, `https://<bff>/auth/callback` |
+| `OIDC_RETURN_ORIGINS` | none | origins allowed in `origin`, comma separated |
+| `POST_LOGIN_REDIRECT_PATH` | `/` | where to go after the login without `returnTo` |
+| `OIDC_POST_LOGOUT_REDIRECT_URL` | origin of the redirect url + `POST_LOGIN_REDIRECT_PATH` | where Keycloak returns after the logout without `origin` |
+| `SESSION__HASH_KEY`, `SESSION__BLOCK_KEY` | | base64, at least 16 bytes each: signing and encryption keys of the cookies |
+| `SESSION_COOKIE_NAME` | `session` | |
+| `SESSION_COOKIE_SECURE` | `true` | `false` only for plain http in local runs |
+| `SESSION_TTL` | `8h` | in the Go format: `8h`, `5m`, `1m30s` |
+| `SESSION_REFRESH_INTERVAL` | `5m` | |
+
+The client is `OIDC__CLIENT_ID` and `OIDC__CLIENT_SECRET` of [authn](#authn). Locally, `python -m oc_svccore.testing.dev_issuer` also answers the browser login and signs in as `--user` at once. `services/notes-bff` is an example BFF that reads notes with its technical account.
+
 ### Metrics endpoint
 
 `create_app` sets up [metrics](#metrics) with its `service` and `checks` and adds:
@@ -531,6 +725,23 @@ Query strings and request bodies are not logged.
 
 The metrics are in the memory of one process, so gunicorn runs one worker per pod (`workers = 1`) and scales with threads and replicas.
 
+### Request body and query
+
+`@web.body(Model)` reads the JSON body, `@web.query(Model)` the query string. Each calls `Model.parse` and passes the DTO to the view as `body` or `query`, next to the path parameters:
+
+```python
+@bp.put("/<int:note_id>")
+@UPDATE_NOTE
+@web.body(note_dto.Update)
+def update_note(note_id: int, body: note_dto.Update):
+    note = service().update(note_id, body.title)
+    return note_dto.Read.model_validate(note).model_dump(mode="json")
+```
+
+- a wrong value is a 400 `validation` before the view runs, so it is checked before any permission inside the view;
+- below a [business operation](#business-operations), wrong input counts as `rejected`. Above it, the operation never sees the attempt;
+- the answer is not serialized for the view: it returns `model_dump(mode="json")` as before.
+
 ### Database session
 
 `web.request_session(database)` gives the session of the current request: one per database, opened on first use and closed when the request ends.
@@ -539,3 +750,108 @@ The metrics are in the memory of one process, so gunicorn runs one worker per po
 def service() -> NoteService:
     return NoteService(NoteRepo(web.request_session(database)))
 ```
+
+## cli (experimental)
+
+`oc_svccore.cli` is the command line counterpart of `web.create_app`, on click. It comes with the `cli` extra, `pip install oc-svccore[cli]`, and does not depend on HTTP. Experimental: the API may change.
+
+```python
+import click
+
+from oc_svccore import cli
+
+app = cli.create_app("notes-cli")
+
+
+@app.command(help="List notes.")
+def list_notes():
+    click.echo(...)
+
+
+if __name__ == "__main__":
+    app()
+```
+
+`cli.create_app(service)` returns a click group that:
+
+- calls `config.setup(service)` before any command, so `.env`, Vault and the config server work as in a web service;
+- logs to stderr as plain text, so the logs never mix with what a command prints: WARNING by default, `-v` for INFO, `-vv` for DEBUG. It does not use `logging.setup`, whose ECS JSON goes to stdout;
+- turns errors into exit codes:
+
+| Case | stderr | Exit code |
+| --- | --- | --- |
+| success | | `0` |
+| a `BaseError` | `error: <message> <data as JSON>` | `1` |
+| a `config.ConfigError` | `error: <the config error>` | `1` |
+| any other exception | the stack trace | `1` |
+| wrong command or arguments | click's usage error | `2` |
+
+Metrics, tracing and health are not set up: a short process does not keep them. `services/notes-cli` is an example that signs in with a service account and calls notes.
+
+## testing
+
+`oc_svccore.testing` comes with the `testing` extra, `pip install oc-svccore[testing]`.
+
+### Tokens without Keycloak
+
+```python
+from oc_svccore.testing import Issuer, bearer
+
+issuer = Issuer()
+app = create_app(database, web.bearer(issuer.verifier()))
+app.test_client().get("/notes", headers=bearer(issuer.token("writer")))
+```
+
+- `Issuer()` makes its own RSA key. `token(username, *groups, expires_in=3600)` signs a token with `preferred_username`, `groups` and the expiry; `sign(claims)` signs any claims, for an expired or a foreign token;
+- `issuer.verifier()` checks its tokens the way `keycloak_verifier` checks the ones of Keycloak, so authentication runs for real and nothing is patched;
+- `bearer(token)` is the `Authorization` header.
+
+### pytest fixtures
+
+The package registers a pytest plugin, so the fixtures need no import:
+
+| Fixture | Scope | Gives |
+| --- | --- | --- |
+| `issuer` | session | an `Issuer` |
+| `client` | test | `app.test_client()` of the `app` fixture, which the service defines |
+| `db_migrations` | session | a function that gets the engine and creates the tables. Does nothing until the service overrides it |
+| `db_engine` | session | an engine on `TEST_DATABASE_URL`, after `db_migrations`. The test fails when the variable is not set |
+| `db_session` | test | a session in a transaction that is rolled back after the test. A commit in the code only releases a savepoint |
+
+The `db_*` fixtures are there with the `db` extra.
+
+```python
+@pytest.fixture(scope="session")
+def db_migrations():
+    return migrate
+
+
+@pytest.fixture
+def app(issuer, db_session):
+    database = Database(os.environ["TEST_DATABASE_URL"])
+    database.sessionmaker = lambda: db_session
+    return create_app(database, web.bearer(issuer.verifier()))
+```
+
+### Fake Keycloak
+
+`python -m oc_svccore.testing.dev_issuer --port 8099 --user dev-user` stands in for Keycloak in local runs and in tests over HTTP:
+
+- it answers the keys (JWKS), the password grant (any password, the token is for the given username), the browser login with PKCE (signs in as `--user` at once, without a form), the refresh and the logout;
+- it prints `OIDC_ISSUER_URL` for the services and a token for `--user` that lives 24 hours;
+- in tests, `DevIssuerServer()` runs it on a free port, and its `issuer` signs tokens for it.
+
+Every local service that calls another must point to the same issuer.
+
+### Spec
+
+```python
+def test_routes_match_the_spec(app):
+    assert_spec(app, "spec/openapi.yaml")
+```
+
+`assert_spec` compares the routes of the app with `paths` of the spec, method by method, and fails with the list of routes missing from the spec and of paths that are not served. Path parameters are compared by place, not by name: `/notes/<int:note_id>` matches `/notes/{noteId}`. The routes of the library itself (the probes, `/metrics`, `/auth/*` of a BFF) may be in the spec or not, as the service prefers. The bodies are not compared. It needs PyYAML, which comes with the `testing` extra.
+
+### Plans
+
+Services and repositories are to be tested on a real database instead of fakes, with the `db_*` fixtures above: each test in its own transaction that is rolled back. For that `db_migrations` needs migrations that build the schema of the database from scratch, and our databases do not have them yet. Until then a service tests its API with `app.test_client()` and its services with `MagicMock` repositories, and the repositories are not tested. `services/notes` already runs on a real database with its alembic migrations.
