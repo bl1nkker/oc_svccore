@@ -1,0 +1,188 @@
+openapi: 3.0.3
+info:
+  title: notes
+  version: "1"
+  description: Example service of oc-svccore.
+security:
+  - bearer: []
+paths:
+  /api/v1/notes:
+    get:
+      summary: List notes
+      operationId: listNotes
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000000, default: 1 }
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [id, -id, title, -title, createdAt, -createdAt]
+            default: id
+      responses:
+        "200":
+          description: A page of notes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotePage" }
+              example:
+                items:
+                  - { id: 1, title: Release checklist, author: writer, createdAt: "2026-11-09T10:15:00Z" }
+                page: 1
+                pageSize: 50
+                total: 1
+        "400":
+          description: A wrong page, page size or sort field
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                validation:
+                  value:
+                    message: _err_msg_validation
+                    code: validation
+                    data: { errors: [{ field: pageSize, message: _err_msg_less_than_equal }] }
+                    traceId: bf4b57dee6ae2b235d7dc377122a43fa
+                invalidSort:
+                  value:
+                    message: _err_msg_invalid_sort
+                    code: invalid_sort
+                    data: { sort: author, allowed: [createdAt, id, title] }
+                    traceId: bf4b57dee6ae2b235d7dc377122a43fa
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    post:
+      summary: Create a note
+      description: Only the users listed in NOTES_WRITERS may create notes.
+      operationId: createNote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateNote" }
+            example: { title: Release checklist }
+      responses:
+        "201":
+          description: The created note
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Note" }
+              example: { id: 1, title: Release checklist, author: writer, createdAt: "2026-11-09T10:15:00Z" }
+        "400":
+          description: A wrong body
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                message: _err_msg_validation
+                code: validation
+                data: { errors: [{ field: title, message: _err_msg_string_too_short }] }
+                traceId: bf4b57dee6ae2b235d7dc377122a43fa
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The caller may not create notes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                message: _err_msg_forbidden
+                code: forbidden
+                data: { permission: notes.write }
+                traceId: bf4b57dee6ae2b235d7dc377122a43fa
+        "409":
+          description: A note with this title exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                message: _err_msg_note_title_taken
+                code: note_title_taken
+                data: {}
+                traceId: bf4b57dee6ae2b235d7dc377122a43fa
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/v1/notes/{noteId}:
+    get:
+      summary: Get a note
+      operationId: getNote
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: The note
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Note" }
+              example: { id: 1, title: Release checklist, author: writer, createdAt: "2026-11-09T10:15:00Z" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No such note
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                message: _err_msg_note_not_found
+                code: note_not_found
+                data: {}
+                traceId: bf4b57dee6ae2b235d7dc377122a43fa
+        "503": { $ref: "#/components/responses/Unavailable" }
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+  schemas:
+    CreateNote:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+    Note:
+      type: object
+      required: [id, title, author, createdAt]
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        author: { type: string, description: username of the caller that created the note }
+        createdAt: { type: string, format: date-time }
+    NotePage:
+      type: object
+      required: [items, page, pageSize, total]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Note" } }
+        page: { type: integer }
+        pageSize: { type: integer }
+        total: { type: integer }
+    Error:
+      type: object
+      required: [message, code, data]
+      properties:
+        message: { type: string, description: translation key of the text }
+        code: { type: string }
+        data: { type: object }
+        traceId: { type: string }
+  responses:
+    Unauthorized:
+      description: No token, or an invalid one
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            message: _err_msg_missing_token
+            code: unauthorized
+            data: {}
+            traceId: bf4b57dee6ae2b235d7dc377122a43fa
+    Unavailable:
+      description: Keycloak does not answer, so the token cannot be checked
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            message: _err_msg_keycloak_unavailable
+            code: upstream_unavailable
+            data: {}
+            traceId: bf4b57dee6ae2b235d7dc377122a43fa

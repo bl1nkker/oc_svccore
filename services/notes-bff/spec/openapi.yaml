@@ -1,0 +1,139 @@
+openapi: 3.0.3
+info:
+  title: notes-bff
+  version: "1"
+  description: >-
+    Example BFF of oc-svccore. The browser signs in through /auth/login, /auth/callback and /auth/logout of the
+    library, which are redirects and are not described here. The BFF calls notes with its own technical account.
+security:
+  - session: []
+paths:
+  /auth/me:
+    get:
+      summary: The signed in user
+      operationId: me
+      responses:
+        "200":
+          description: The user of the session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+              example: { authenticated: true, sub: 6f1c, username: someone, name: Some One, email: someone@example.test }
+        "401": { $ref: "#/components/responses/NoSession" }
+  /api/v1/notes:
+    get:
+      summary: List notes
+      description: Passes page, pageSize and sort to notes and returns its answer.
+      operationId: listNotes
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000000, default: 1 }
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [id, -id, title, -title, createdAt, -createdAt]
+            default: id
+      responses:
+        "200":
+          description: A page of notes, as notes answered it
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotePage" }
+              example:
+                items:
+                  - { id: 1, title: Release checklist, author: svc-notes-bff, createdAt: "2026-11-09T10:15:00Z" }
+                page: 1
+                pageSize: 50
+                total: 1
+        "400":
+          description: A wrong page size, checked here, or a wrong sort field, as notes answered it
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                validation:
+                  value:
+                    message: _err_msg_validation
+                    code: validation
+                    data: { errors: [{ field: pageSize, message: _err_msg_less_than_equal }] }
+                    traceId: bf4b57dee6ae2b235d7dc377122a43fa
+                invalidSort:
+                  value:
+                    message: _err_msg_invalid_sort
+                    code: invalid_sort
+                    data: { sort: author, allowed: [createdAt, id, title] }
+                    traceId: bf4b57dee6ae2b235d7dc377122a43fa
+        "401": { $ref: "#/components/responses/NoSession" }
+        "502":
+          description: notes refused the BFF
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                message: _err_msg_notes_rejected
+                code: upstream_error
+                data: { status: 401 }
+                traceId: bf4b57dee6ae2b235d7dc377122a43fa
+        "503":
+          description: notes or Keycloak does not answer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                message: _err_msg_notes_unavailable
+                code: upstream_unavailable
+                data: {}
+                traceId: bf4b57dee6ae2b235d7dc377122a43fa
+components:
+  securitySchemes:
+    session: { type: apiKey, in: cookie, name: session }
+  schemas:
+    Me:
+      type: object
+      required: [authenticated, sub, username, name, email]
+      properties:
+        authenticated: { type: boolean }
+        sub: { type: string }
+        username: { type: string }
+        name: { type: string }
+        email: { type: string }
+    Note:
+      type: object
+      required: [id, title, author, createdAt]
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        author: { type: string }
+        createdAt: { type: string, format: date-time }
+    NotePage:
+      type: object
+      required: [items, page, pageSize, total]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Note" } }
+        page: { type: integer }
+        pageSize: { type: integer }
+        total: { type: integer }
+    Error:
+      type: object
+      required: [message, code, data]
+      properties:
+        message: { type: string, description: translation key of the text }
+        code: { type: string }
+        data: { type: object }
+        traceId: { type: string }
+  responses:
+    NoSession:
+      description: No session, or it ended
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            message: _err_msg_no_session
+            code: unauthorized
+            data: {}
+            traceId: bf4b57dee6ae2b235d7dc377122a43fa
