@@ -22,7 +22,7 @@ def create_app(
     import_name: str,
     *,
     service: str,
-    authenticate: Authenticate,
+    authenticate: Authenticate | None,
     checks: dict[str, Check] | None = None,
     errors_mapping: dict[type[BaseError], int] | None = None,
 ) -> Flask:
@@ -39,7 +39,8 @@ def create_app(
     log_requests(app, skip_paths=PROBE_PATHS)
     instrument_flask(app, excluded_paths=PROBE_PATHS)
     # authentication
-    app.before_request(authentication_hook(authenticate))
+    if authenticate is not None:
+        app.before_request(authentication_hook(authenticate))
     if isinstance(authenticate, SessionAuth):
         app.register_blueprint(authenticate.blueprint)
     app.after_request(add_trace_id_header)

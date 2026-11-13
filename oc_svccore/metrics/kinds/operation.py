@@ -5,7 +5,6 @@ from functools import wraps
 from typing import Any, TypeVar
 
 from prometheus_client import Counter, Gauge, Histogram
-from pydantic import ValidationError
 
 from oc_svccore.errors.base_error import BaseError
 from oc_svccore.errors.types import UpstreamError
@@ -45,7 +44,7 @@ class Operation:
         try:
             yield
             outcome = "success"
-        except (BaseError, ValidationError) as e:
+        except BaseError as e:
             outcome = "failed" if isinstance(e, UpstreamError) else "rejected"
             raise
         finally:

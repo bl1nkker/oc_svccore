@@ -8,6 +8,7 @@ from prometheus_client import Counter, Histogram
 from oc_svccore.metrics.registry import BUCKETS, get_or_create
 
 _RULE_PARAM = re.compile(r"<(?:[^:<>]+:)?([^<>]+)>")
+_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 
 
 def instrument_requests(app: Flask, skip_paths: Collection[str]) -> None:
@@ -22,8 +23,9 @@ def instrument_requests(app: Flask, skip_paths: Collection[str]) -> None:
         started = g.pop("oc_svccore_metrics_started", None)
         if started is not None and request.path not in skip_paths:
             route = _RULE_PARAM.sub(r"{\1}", request.url_rule.rule) if request.url_rule else "unmatched"
-            requests_total.labels(request.method, route, str(response.status_code)).inc()
-            duration.labels(request.method, route).observe(time.perf_counter() - started)
+            method = request.method if request.method in _METHODS else "OTHER"
+            requests_total.labels(method, route, str(response.status_code)).inc()
+            duration.labels(method, route).observe(time.perf_counter() - started)
         return response
 
     app.before_request(start)

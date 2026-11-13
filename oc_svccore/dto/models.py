@@ -1,7 +1,9 @@
-from typing import Generic, TypeVar
+from typing import Any, Generic, Self, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic.alias_generators import to_camel
+
+from oc_svccore.dto.validation_failed_error import ValidationFailedError
 
 T = TypeVar("T")
 
@@ -15,9 +17,16 @@ class ApiModel(BaseModel):
         from_attributes=True,
     )
 
+    @classmethod
+    def parse(cls, data: Any) -> Self:
+        try:
+            return cls.model_validate(data)
+        except ValidationError as e:
+            raise ValidationFailedError.from_pydantic(e) from None
+
 
 class ListQuery(ApiModel):
-    page: int = Field(1, ge=1)
+    page: int = Field(1, ge=1, le=1_000_000)
     page_size: int = Field(50, ge=1, le=500)
     sort: str | None = None
     search: str | None = None
